@@ -5,8 +5,8 @@ using Oxide.Core.Libraries.Covalence;
 
 namespace Oxide.Plugins
 {
-    [Info("Easy Commands", "Dyls123", "2.9.0")]
-    [Description("General utility commands: in-game time, scheduled/optional skip night, wipe info, admin whisper, and manual/broadcast wipe + skip vote.")]
+    [Info("Easy Commands", "Dyls123", "3.0.0")]
+    [Description("General utility commands: in-game time, skip night vote, wipe info, admin whisper, timers, and manual/broadcast wipe + skip vote.")]
     public class EasyCommands : CovalencePlugin
     {
         #region Configuration
@@ -42,7 +42,7 @@ namespace Oxide.Plugins
             public int VoteStartHour = 18;
 
             // Percentage of online players required to pass (1–100)
-            public int RequiredPercentage = 60;
+            public int RequiredPercentage = 100;
 
             // Hour to skip to when vote passes (e.g. 8 = 08:00 / 8 AM)
             public float SkipToHour = 8f;
@@ -77,6 +77,24 @@ namespace Oxide.Plugins
             public string MsgToSender = "To {TargetName}: {Message}";
         }
 
+        private class TimerSettings
+        {
+            public bool Enabled = true;
+
+            // Chat command, e.g. "!timer"
+            public string Command = "!timer";
+
+            // Maximum active timers per player
+            public int MaxTimersPerPlayer = 3;
+
+            // Messages
+            public string MsgTimerCreated = "Timer {Label} set for {Duration}.";
+            public string MsgTimerExpired = "Timer {Label} is up!";
+            public string MsgTooManyTimers = "You already have the maximum number of active timers.";
+            public string MsgInvalidSyntax = "Usage: !timer <duration> <label>. Example: !timer 10m Create";
+            public string MsgInvalidDuration = "Invalid duration. Use formats like 30s, 5m, 1h.";
+        }
+
         private class WipeSettings
         {
             public bool Enabled = true;
@@ -88,8 +106,9 @@ namespace Oxide.Plugins
             public string Message = "Next wipe: {WipeTime}";
 
             // How we calculate wipe:
-            // "Static", "Weekly", "Fortnightly", "MonthlyByDate", "MonthlyByDay"
-            public string Mode = "Static";
+            // "Static", "Weekly" (with WeeksCount), "MonthlyByDate", "MonthlyByDay"
+            public string Mode = "Monthly";
+            public int WeeksCount = 1; // number of weeks for Weekly mode
 
             // STATIC mode
             public string StaticDateTime = "2025-01-01 18:00";
@@ -106,7 +125,7 @@ namespace Oxide.Plugins
 
             // MONTHLY BY DAY mode (e.g. last Thursday)
             public string DayOfWeek = "Thursday";       // Monday..Sunday
-            public string Position = "Last";            // First, Second, Third, Fourth, Last
+            public string Position = "First";            // First, Second, Third, Fourth, Last
             public string TimeOfDayMonthly = "18:00";   // HH:mm
 
             // Display format for players
@@ -122,7 +141,14 @@ namespace Oxide.Plugins
             public TimeCommandSettings Time = new TimeCommandSettings();
             public SkipNightSettings SkipNight = new SkipNightSettings();
             public WhisperSettings Whisper = new WhisperSettings();
+            public TimerSettings Timer = new TimerSettings();
             public WipeSettings Wipe = new WipeSettings();
+            public WipeSettings BPWipe = new WipeSettings
+            {
+                Command = "!bpwipe",
+                Message = "Next BP wipe: {WipeTime}",
+                BroadcastCommand = "ec.broadcastbpwipe"
+            };
         }
 
         protected override void LoadDefaultConfig()
@@ -162,6 +188,20 @@ namespace Oxide.Plugins
 
         #endregion
 
+        #region Timer state
+
+        private class PlayerTimerInfo
+        {
+            public string Label;
+            public DateTime EndTime;
+            public double DurationSeconds;
+        }
+
+        private readonly Dictionary<string, List<PlayerTimerInfo>> activeTimers =
+            new Dictionary<string, List<PlayerTimerInfo>>();
+
+        #endregion
+
         #region Hooks
 
         private void Init()
@@ -173,8 +213,11 @@ namespace Oxide.Plugins
                 $"Time=\"{config.Time.Command}\" (enabled={config.Time.Enabled}), " +
                 $"Skip=\"{config.SkipNight.Command}\" (enabled={config.SkipNight.Enabled}, scheduled at {config.SkipNight.VoteStartHour}:00, auto={config.SkipNight.AutoStart}), " +
                 $"ForceSkip=\"{config.SkipNight.ForceStartCommand}\", " +
+                $"Timer=\"{config.Timer.Command}\" (enabled={config.Timer.Enabled}, max per player={config.Timer.MaxTimersPerPlayer}), " +
                 $"Wipe=\"{config.Wipe.Command}\" (enabled={config.Wipe.Enabled}), " +
+                $"BPWipe=\"{config.BPWipe.Command}\" (enabled={config.BPWipe.Enabled}), " +
                 $"WipeBroadcast=\"{config.Wipe.BroadcastCommand}\", " +
+                $"BPWipeBroadcast=\"{config.BPWipe.BroadcastCommand}\", " +
                 $"Whisper=\"{config.Whisper.ConsoleCommand}\" (enabled={config.Whisper.Enabled})"
             );
 
@@ -195,6 +238,10 @@ namespace Oxide.Plugins
             {
                 AddCovalenceCommand(config.Wipe.BroadcastCommand, "CmdBroadcastWipe");
             }
+            if (config.BPWipe.Enabled && !string.IsNullOrWhiteSpace(config.BPWipe.BroadcastCommand))
+            {
+                AddCovalenceCommand(config.BPWipe.BroadcastCommand, "CmdBroadcastBPWipe");
+            }
 
             // Start the scheduled skip-night checker (only if AutoStart)
             StartSkipNightTimer();
@@ -202,6 +249,11 @@ namespace Oxide.Plugins
 
         private void ValidateConfig()
         {
+            if (config.Wipe == null) config.Wipe = new WipeSettings();
+            if (config.BPWipe == null) config.BPWipe = new WipeSettings { Command = "!bpwipe", Message = "Next BP wipe: {WipeTime}", BroadcastCommand = "ec.broadcastbpwipe" };
+            NormalizeWipeSettings(config.Wipe, "!wipe", "ec.broadcastwipe", "Next wipe: {WipeTime}");
+            NormalizeWipeSettings(config.BPWipe, "!bpwipe", "ec.broadcastbpwipe", "Next BP wipe: {WipeTime}");
+
             if (string.IsNullOrWhiteSpace(config.Time.Command))
                 config.Time.Command = "!time";
 
@@ -214,35 +266,26 @@ namespace Oxide.Plugins
             if (string.IsNullOrWhiteSpace(config.Whisper.ConsoleCommand))
                 config.Whisper.ConsoleCommand = "ec.whisper";
 
-            if (string.IsNullOrWhiteSpace(config.Wipe.Command))
-                config.Wipe.Command = "!wipe";
+            if (string.IsNullOrWhiteSpace(config.Timer.Command))
+                config.Timer.Command = "!timer";
 
-            if (string.IsNullOrWhiteSpace(config.Wipe.Mode))
-                config.Wipe.Mode = "Static";
+            if (config.Timer.MaxTimersPerPlayer < 1)
+                config.Timer.MaxTimersPerPlayer = 1;
 
-            if (string.IsNullOrWhiteSpace(config.Wipe.StaticInputFormat))
-                config.Wipe.StaticInputFormat = "yyyy-MM-dd HH:mm";
+            if (string.IsNullOrWhiteSpace(config.Timer.MsgTimerCreated))
+                config.Timer.MsgTimerCreated = "Timer {Label} set for {Duration}.";
 
-            if (string.IsNullOrWhiteSpace(config.Wipe.AnchorInputFormat))
-                config.Wipe.AnchorInputFormat = "yyyy-MM-dd HH:mm";
+            if (string.IsNullOrWhiteSpace(config.Timer.MsgTimerExpired))
+                config.Timer.MsgTimerExpired = "Timer {Label} is up!";
 
-            if (string.IsNullOrWhiteSpace(config.Wipe.OutputFormat))
-                config.Wipe.OutputFormat = "dddd, dd MMM yyyy HH:mm";
+            if (string.IsNullOrWhiteSpace(config.Timer.MsgTooManyTimers))
+                config.Timer.MsgTooManyTimers = "You already have the maximum number of active timers.";
 
-            if (string.IsNullOrWhiteSpace(config.Wipe.TimeOfDay))
-                config.Wipe.TimeOfDay = "18:00";
+            if (string.IsNullOrWhiteSpace(config.Timer.MsgInvalidSyntax))
+                config.Timer.MsgInvalidSyntax = "Usage: !timer <duration> <label>. Example: !timer 10m Create";
 
-            if (string.IsNullOrWhiteSpace(config.Wipe.TimeOfDayMonthly))
-                config.Wipe.TimeOfDayMonthly = "18:00";
-
-            if (string.IsNullOrWhiteSpace(config.Wipe.DayOfWeek))
-                config.Wipe.DayOfWeek = "Thursday";
-
-            if (string.IsNullOrWhiteSpace(config.Wipe.Position))
-                config.Wipe.Position = "Last";
-
-            if (string.IsNullOrWhiteSpace(config.Wipe.BroadcastCommand))
-                config.Wipe.BroadcastCommand = "ec.broadcastwipe";
+            if (string.IsNullOrWhiteSpace(config.Timer.MsgInvalidDuration))
+                config.Timer.MsgInvalidDuration = "Invalid duration. Use formats like 30s, 5m, 1h.";
 
             if (config.SkipNight.RequiredPercentage < 1)
                 config.SkipNight.RequiredPercentage = 1;
@@ -260,6 +303,33 @@ namespace Oxide.Plugins
                 config.SkipNight.SkipToHour = 24f;
 
             SaveConfig();
+        }
+
+        private void NormalizeWipeSettings(WipeSettings s, string defaultCommand, string defaultBroadcast, string defaultMessage)
+        {
+            if (string.IsNullOrWhiteSpace(s.Command))
+                s.Command = defaultCommand;
+            if (string.IsNullOrWhiteSpace(s.Message))
+                s.Message = defaultMessage;
+            if (string.IsNullOrWhiteSpace(s.Mode))
+                s.Mode = "Static";
+            if (s.WeeksCount < 1) s.WeeksCount = 1;
+            if (string.IsNullOrWhiteSpace(s.StaticInputFormat))
+                s.StaticInputFormat = "yyyy-MM-dd HH:mm";
+            if (string.IsNullOrWhiteSpace(s.AnchorInputFormat))
+                s.AnchorInputFormat = "yyyy-MM-dd HH:mm";
+            if (string.IsNullOrWhiteSpace(s.OutputFormat))
+                s.OutputFormat = "dddd, dd MMM yyyy HH:mm";
+            if (string.IsNullOrWhiteSpace(s.TimeOfDay))
+                s.TimeOfDay = "18:00";
+            if (string.IsNullOrWhiteSpace(s.TimeOfDayMonthly))
+                s.TimeOfDayMonthly = "18:00";
+            if (string.IsNullOrWhiteSpace(s.DayOfWeek))
+                s.DayOfWeek = "Thursday";
+            if (string.IsNullOrWhiteSpace(s.Position))
+                s.Position = "Last";
+            if (string.IsNullOrWhiteSpace(s.BroadcastCommand))
+                s.BroadcastCommand = defaultBroadcast;
         }
 
         private void StartSkipNightTimer()
@@ -282,7 +352,7 @@ namespace Oxide.Plugins
 
         /// <summary>
         /// Called whenever a user sends a chat message.
-        /// We match against the configured chat commands (time, skip vote, wipe).
+        /// We match against the configured chat commands (time, skip vote, wipe, timer).
         /// </summary>
         private object OnUserChat(IPlayer player, string message)
         {
@@ -311,7 +381,29 @@ namespace Oxide.Plugins
             if (config.Wipe.Enabled &&
                 msg.Equals(config.Wipe.Command, StringComparison.OrdinalIgnoreCase))
             {
-                SendWipeMessage(player);
+                SendWipeMessage(player, config.Wipe);
+                return true; // block original message
+            }
+
+            // BP Wipe command
+            if (config.BPWipe.Enabled &&
+                msg.Equals(config.BPWipe.Command, StringComparison.OrdinalIgnoreCase))
+            {
+                SendWipeMessage(player, config.BPWipe);
+                return true; // block original message
+            }
+
+            // Timer command (supports args: !timer 10m Create)
+            if (config.Timer.Enabled &&
+                msg.Length >= config.Timer.Command.Length &&
+                msg.StartsWith(config.Timer.Command, StringComparison.OrdinalIgnoreCase) &&
+                (msg.Length == config.Timer.Command.Length || char.IsWhiteSpace(msg[config.Timer.Command.Length])))
+            {
+                string argsText = msg.Length == config.Timer.Command.Length
+                    ? string.Empty
+                    : msg.Substring(config.Timer.Command.Length).TrimStart();
+
+                HandleTimerCommand(player, argsText);
                 return true; // block original message
             }
 
@@ -381,7 +473,7 @@ namespace Oxide.Plugins
             {
                 player.Message(FormatMessage(config.SkipNight.MsgNoActiveVote));
                 return;
-            } 
+            }
 
             // Already voted?
             if (skipVoters.Contains(player.Id))
@@ -491,46 +583,188 @@ namespace Oxide.Plugins
 
         #endregion
 
+        #region Timer command
+
+        private void HandleTimerCommand(IPlayer player, string argsText)
+        {
+            if (string.IsNullOrWhiteSpace(argsText))
+            {
+                player.Message(FormatMessage(config.Timer.MsgInvalidSyntax));
+                return;
+            }
+
+            // Split "<duration> <label...>"
+            var parts = argsText.Split(new[] { ' ' }, 2, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 0)
+            {
+                player.Message(FormatMessage(config.Timer.MsgInvalidSyntax));
+                return;
+            }
+
+            string durationToken = parts[0];
+            string label = parts.Length > 1 ? parts[1].Trim() : "Timer";
+
+            if (!TryParseDuration(durationToken, out double seconds, out string niceDuration))
+            {
+                player.Message(FormatMessage(config.Timer.MsgInvalidDuration));
+                return;
+            }
+
+            if (seconds <= 0)
+            {
+                player.Message(FormatMessage(config.Timer.MsgInvalidDuration));
+                return;
+            }
+
+            if (!activeTimers.TryGetValue(player.Id, out var list))
+            {
+                list = new List<PlayerTimerInfo>();
+                activeTimers[player.Id] = list;
+            }
+
+            if (list.Count >= config.Timer.MaxTimersPerPlayer)
+            {
+                player.Message(FormatMessage(config.Timer.MsgTooManyTimers));
+                return;
+            }
+
+            var info = new PlayerTimerInfo
+            {
+                Label = label,
+                EndTime = DateTime.UtcNow.AddSeconds(seconds),
+                DurationSeconds = seconds
+            };
+
+            list.Add(info);
+
+            string createdMsg = config.Timer.MsgTimerCreated
+                .Replace("{Label}", label)
+                .Replace("{Duration}", niceDuration);
+
+            player.Message(FormatMessage(createdMsg));
+
+            // Schedule the timer
+            timer.Once((float)seconds, () =>
+            {
+                // Remove from active list
+                if (activeTimers.TryGetValue(player.Id, out var timersForPlayer))
+                {
+                    timersForPlayer.Remove(info);
+                    if (timersForPlayer.Count == 0)
+                        activeTimers.Remove(player.Id);
+                }
+
+                var target = players.FindPlayer(player.Id);
+                if (target == null)
+                    return;
+
+                string expiredMsg = config.Timer.MsgTimerExpired
+                    .Replace("{Label}", label);
+
+                target.Message(FormatMessage(expiredMsg));
+            });
+        }
+
+        // Parses "10m", "30s", "1h", or bare "10" as minutes.
+        private bool TryParseDuration(string input, out double seconds, out string pretty)
+        {
+            seconds = 0;
+            pretty = string.Empty;
+
+            if (string.IsNullOrWhiteSpace(input))
+                return false;
+
+            string s = input.Trim().ToLowerInvariant();
+            if (s.Length == 0)
+                return false;
+
+            double multiplier;
+            string numberPart;
+            char last = s[s.Length - 1];
+
+            switch (last)
+            {
+                case 's':
+                    multiplier = 1;
+                    numberPart = s.Substring(0, s.Length - 1);
+                    break;
+                case 'm':
+                    multiplier = 60;
+                    numberPart = s.Substring(0, s.Length - 1);
+                    break;
+                case 'h':
+                    multiplier = 3600;
+                    numberPart = s.Substring(0, s.Length - 1);
+                    break;
+                default:
+                    // No suffix -> treat as minutes
+                    multiplier = 60;
+                    numberPart = s;
+                    break;
+            }
+
+            if (!double.TryParse(numberPart, NumberStyles.Float, CultureInfo.InvariantCulture, out double value))
+                return false;
+
+            if (value <= 0)
+                return false;
+
+            seconds = value * multiplier;
+
+            if (multiplier == 1)
+                pretty = $"{value:0} seconds";
+            else if (multiplier == 60)
+                pretty = $"{value:0} minutes";
+            else if (multiplier == 3600)
+                pretty = $"{value:0} hours";
+            else
+                pretty = $"{value:0} units";
+
+            return true;
+        }
+
+        #endregion
+
         #region Wipe command
 
-        private void SendWipeMessage(IPlayer player)
+        private void SendWipeMessage(IPlayer player, WipeSettings settings)
         {
-            string wipeTime = GetWipeTimeString();
+            string wipeTime = GetWipeTimeString(settings);
 
-            string message = config.Wipe.Message.Replace("{WipeTime}", wipeTime);
+            string message = settings.Message.Replace("{WipeTime}", wipeTime);
 
             string final = FormatMessage(message);
             player.Message(final);
         }
 
-        private string GetWipeTimeString()
+        private string GetWipeTimeString(WipeSettings settings)
         {
             try
             {
                 DateTime now = DateTime.Now;
                 DateTime next;
 
-                switch (config.Wipe.Mode)
+                switch (settings.Mode)
                 {
                     case "Weekly":
-                        next = GetNextFromAnchor(now, 7);
+                        next = GetNextFromAnchor(now, settings.WeeksCount * 7, settings);
                         break;
-                    case "Fortnightly":
-                        next = GetNextFromAnchor(now, 14);
+                    case "Fortnightly": // legacy; treat as 2-week schedule
+                        next = GetNextFromAnchor(now, 14, settings);
                         break;
                     case "MonthlyByDate":
-                        next = GetNextMonthlyByDate(now);
+                        next = GetNextMonthlyByDate(now, settings);
                         break;
                     case "MonthlyByDay":
-                        next = GetNextMonthlyByDay(now);
+                        next = GetNextMonthlyByDay(now, settings);
                         break;
                     case "Static":
                     default:
-                        next = ParseStaticDate();
+                        next = ParseStaticDate(settings);
                         break;
                 }
 
-                return next.ToString(config.Wipe.OutputFormat);
+                return next.ToString(settings.OutputFormat);
             }
             catch (Exception ex)
             {
@@ -539,21 +773,22 @@ namespace Oxide.Plugins
             }
         }
 
-        private DateTime ParseStaticDate()
+        private DateTime ParseStaticDate(WipeSettings settings)
         {
             return DateTime.ParseExact(
-                config.Wipe.StaticDateTime,
-                config.Wipe.StaticInputFormat,
+                settings.StaticDateTime,
+                settings.StaticInputFormat,
                 CultureInfo.InvariantCulture,
                 DateTimeStyles.AssumeLocal
             );
         }
 
-        private DateTime GetNextFromAnchor(DateTime now, int periodDays)
+        private DateTime GetNextFromAnchor(DateTime now, int periodDays, WipeSettings settings)
         {
+            if (periodDays < 1) periodDays = 1;
             DateTime anchor = DateTime.ParseExact(
-                config.Wipe.AnchorDateTime,
-                config.Wipe.AnchorInputFormat,
+                settings.AnchorDateTime,
+                settings.AnchorInputFormat,
                 CultureInfo.InvariantCulture,
                 DateTimeStyles.AssumeLocal
             );
@@ -567,12 +802,12 @@ namespace Oxide.Plugins
             return candidate;
         }
 
-        private DateTime GetNextMonthlyByDate(DateTime now)
+        private DateTime GetNextMonthlyByDate(DateTime now, WipeSettings settings)
         {
             int year = now.Year;
             int month = now.Month;
 
-            DateTime candidate = BuildMonthlyDate(year, month, config.Wipe.DayOfMonth, config.Wipe.TimeOfDay);
+            DateTime candidate = BuildMonthlyDate(year, month, settings.DayOfMonth, settings.TimeOfDay);
 
             if (candidate <= now)
             {
@@ -586,7 +821,7 @@ namespace Oxide.Plugins
                 {
                     month++;
                 }
-                candidate = BuildMonthlyDate(year, month, config.Wipe.DayOfMonth, config.Wipe.TimeOfDay);
+                candidate = BuildMonthlyDate(year, month, settings.DayOfMonth, settings.TimeOfDay);
             }
 
             return candidate;
@@ -602,12 +837,12 @@ namespace Oxide.Plugins
             return new DateTime(year, month, day, time.Hours, time.Minutes, 0);
         }
 
-        private DateTime GetNextMonthlyByDay(DateTime now)
+        private DateTime GetNextMonthlyByDay(DateTime now, WipeSettings settings)
         {
             int year = now.Year;
             int month = now.Month;
 
-            DateTime candidate = BuildMonthlyByDay(year, month);
+            DateTime candidate = BuildMonthlyByDay(year, month, settings);
 
             if (candidate <= now)
             {
@@ -621,17 +856,17 @@ namespace Oxide.Plugins
                 {
                     month++;
                 }
-                candidate = BuildMonthlyByDay(year, month);
+                candidate = BuildMonthlyByDay(year, month, settings);
             }
 
             return candidate;
         }
 
-        private DateTime BuildMonthlyByDay(int year, int month)
+        private DateTime BuildMonthlyByDay(int year, int month, WipeSettings settings)
         {
-            DayOfWeek targetDay = ParseDayOfWeek(config.Wipe.DayOfWeek);
+            DayOfWeek targetDay = ParseDayOfWeek(settings.DayOfWeek);
             TimeSpan time = TimeSpan.ParseExact(
-                config.Wipe.TimeOfDayMonthly,
+                settings.TimeOfDayMonthly,
                 @"hh\:mm",
                 CultureInfo.InvariantCulture
             );
@@ -655,7 +890,7 @@ namespace Oxide.Plugins
 
             DateTime selected;
 
-            switch (config.Wipe.Position)
+            switch (settings.Position)
             {
                 case "First":
                     selected = matches[0];
@@ -791,12 +1026,29 @@ namespace Oxide.Plugins
                 return;
             }
 
-            string wipeTime = GetWipeTimeString();
+            string wipeTime = GetWipeTimeString(config.Wipe);
             string message = config.Wipe.Message.Replace("{WipeTime}", wipeTime);
 
             BroadcastMessage(message);
 
             caller?.Message(FormatMessage("Broadcasted wipe time to all players."));
+        }
+
+        // Console/RCON/admin command: broadcast the next BP wipe to everyone
+        private void CmdBroadcastBPWipe(IPlayer caller, string command, string[] args)
+        {
+            if (!config.BPWipe.Enabled)
+            {
+                caller?.Message(FormatMessage("BP wipe system is disabled."));
+                return;
+            }
+
+            string wipeTime = GetWipeTimeString(config.BPWipe);
+            string message = config.BPWipe.Message.Replace("{WipeTime}", wipeTime);
+
+            BroadcastMessage(message);
+
+            caller?.Message(FormatMessage("Broadcasted BP wipe time to all players."));
         }
 
         #endregion
@@ -821,4 +1073,3 @@ namespace Oxide.Plugins
         #endregion
     }
 }
-
