@@ -42,6 +42,7 @@ Allows admins or the server console to privately message players.
 Perfect for welcome messages, warnings, or support
 Designed to work with RustAdmin / RCON automation
 Fully customizable message formats
+
 ✅ Global Styling
 
 Optional global prefix
