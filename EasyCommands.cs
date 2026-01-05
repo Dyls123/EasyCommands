@@ -15,7 +15,7 @@ namespace Oxide.Plugins
 
         private class GlobalSettings
         {
-            public bool UsePrefix = true;
+            public bool UsePrefix = false;
             public string Prefix = "[EasyCommands]";
             public string PrefixColor = "#00FFFF";
             public string MessageColor = "#FFFFFF";
@@ -26,9 +26,18 @@ namespace Oxide.Plugins
             public bool Enabled = true;
             public string Command = "!time";
             public string Message = "The current in-game time is: {Time}";
+            public bool Broadcast = false;
             public string TimeFormat = "HH:mm";
             public string DateFormat = "yyyy-MM-dd";
             public bool ShowDate = true;
+        }
+
+        private class PopCommandSettings
+        {
+            public bool Enabled = true;
+            public string Command = "!pop";
+            public string Message = "There are {Count} players currently online.";
+            public bool Broadcast = true;
         }
 
         private class SkipNightSettings
@@ -104,19 +113,20 @@ namespace Oxide.Plugins
 
             // Message template; {WipeTime} will be replaced
             public string Message = "Next wipe: {WipeTime}";
+            public bool Broadcast = false;
 
             // How we calculate wipe:
             // "Static", "Weekly" (with WeeksCount), "MonthlyByDate", "MonthlyByDay"
-            public string Mode = "Monthly";
-            public int WeeksCount = 1; // number of weeks for Weekly mode
+            public string Mode = "Weekly";
+            public int WeeksCount = 2; // number of weeks for Weekly mode
 
             // STATIC mode
-            public string StaticDateTime = "2025-01-01 18:00";
+            public string StaticDateTime = "2026-01-01 18:00";
             public string StaticInputFormat = "yyyy-MM-dd HH:mm";
 
             // WEEKLY / FORTNIGHTLY modes
             // Known wipe date that follows the pattern
-            public string AnchorDateTime = "2025-01-02 18:00";
+            public string AnchorDateTime = "2026-01-01 18:00";
             public string AnchorInputFormat = "yyyy-MM-dd HH:mm";
 
             // MONTHLY BY DATE mode
@@ -139,6 +149,7 @@ namespace Oxide.Plugins
         {
             public GlobalSettings Global = new GlobalSettings();
             public TimeCommandSettings Time = new TimeCommandSettings();
+            public PopCommandSettings Pop = new PopCommandSettings();
             public SkipNightSettings SkipNight = new SkipNightSettings();
             public WhisperSettings Whisper = new WhisperSettings();
             public TimerSettings Timer = new TimerSettings();
@@ -147,6 +158,11 @@ namespace Oxide.Plugins
             {
                 Command = "!bpwipe",
                 Message = "Next BP wipe: {WipeTime}",
+                Broadcast = false,
+                Mode = "Weekly",
+                WeeksCount = 2,
+                StaticDateTime = "2026-01-01 18:00",
+                AnchorDateTime = "2026-01-01 18:00",
                 BroadcastCommand = "ec.broadcastbpwipe"
             };
         }
@@ -256,6 +272,9 @@ namespace Oxide.Plugins
 
             if (string.IsNullOrWhiteSpace(config.Time.Command))
                 config.Time.Command = "!time";
+            if (config.Pop == null) config.Pop = new PopCommandSettings();
+            if (string.IsNullOrWhiteSpace(config.Pop.Command))
+                config.Pop.Command = "!pop";
 
             if (string.IsNullOrWhiteSpace(config.SkipNight.Command))
                 config.SkipNight.Command = "!skip";
@@ -374,6 +393,14 @@ namespace Oxide.Plugins
                 msg.Equals(config.Time.Command, StringComparison.OrdinalIgnoreCase))
             {
                 SendTimeMessage(player);
+                return true; // block original message
+            }
+
+            // Pop command (online count)
+            if (config.Pop.Enabled &&
+                msg.Equals(config.Pop.Command, StringComparison.OrdinalIgnoreCase))
+            {
+                SendPopMessage(player);
                 return true; // block original message
             }
 
@@ -561,8 +588,14 @@ namespace Oxide.Plugins
 
             string message = config.Time.Message.Replace("{Time}", timeOutput);
 
-            string final = FormatMessage(message);
-            player.Message(final);
+            SendPerScopeMessage(message, config.Time.Broadcast, player);
+        }
+
+        private void SendPopMessage(IPlayer player)
+        {
+            int online = GetOnlinePlayerCount();
+            string message = config.Pop.Message.Replace("{Count}", online.ToString());
+            SendPerScopeMessage(message, config.Pop.Broadcast, player);
         }
 
         private string GetInGameTimeString()
@@ -733,8 +766,7 @@ namespace Oxide.Plugins
 
             string message = settings.Message.Replace("{WipeTime}", wipeTime);
 
-            string final = FormatMessage(message);
-            player.Message(final);
+            SendPerScopeMessage(message, settings.Broadcast, player);
         }
 
         private string GetWipeTimeString(WipeSettings settings)
@@ -1068,6 +1100,15 @@ namespace Oxide.Plugins
         {
             string final = FormatMessage(message);
             server.Broadcast(final);
+        }
+
+        private void SendPerScopeMessage(string message, bool broadcast, IPlayer player)
+        {
+            string final = FormatMessage(message);
+            if (broadcast)
+                server.Broadcast(final);
+            else
+                player.Message(final);
         }
 
         #endregion
